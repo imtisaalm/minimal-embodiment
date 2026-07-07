@@ -207,6 +207,12 @@ bool buzzerOk = false;
 bool micOk = false;
 bool fsrOk = false;
 bool thermOk = false;
+// Peak-hold for FSR: the main loop idles in 200ms ticks between posts, so we
+// sample the FSR on every tick and keep the max. Without this, a touch only
+// registers if the finger happens to be down at the instant of the 10s post —
+// the thermistor "remembers" skin contact (thermal inertia) but the FSR
+// (instantaneous read) does not. No new task, no extra TLS session.
+int fsrPeakSinceLast = 0;
 
 // Handle for the I2S RX channel (INMP441). Held globally so
 // readMicNoiseDb() can pull samples from anywhere; opened once in setup.
@@ -1075,6 +1081,10 @@ void loop() {
   // Wait until the next scheduled post
   unsigned long now = millis();
   if (now - lastPostMs < POST_INTERVAL_MS) {
+    if (fsrOk) {
+      int v = analogRead(FSR_PIN);
+      if (v > fsrPeakSinceLast) fsrPeakSinceLast = v;
+    }
     delay(200);
     return;
   }
@@ -1121,8 +1131,10 @@ void loop() {
   int fsrRaw = 0;
   bool touchDetected = false;
   if (fsrOk) {
-    fsrRaw = analogRead(FSR_PIN);
+    int instant = analogRead(FSR_PIN);
+    fsrRaw = max(instant, fsrPeakSinceLast);  // peak within this 10s window
     touchDetected = (fsrRaw > FSR_TOUCH_THRESHOLD);
+    fsrPeakSinceLast = 0;                     // reset for next window
   }
 
   int thermRaw = 0;
