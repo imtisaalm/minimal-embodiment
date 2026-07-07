@@ -378,6 +378,7 @@ function handleSensorStatus(): {
   reading: SensorReading | null;
   age_seconds: number | null;
   recent_beep_echo: (BeepEcho & { age_seconds: number }) | null;
+  instance: string;
 } {
   // Bundle the most recent beep echo too — same idea as currentRoom():
   // every "where am I" query sees both the input side (sensor reading) and
@@ -397,6 +398,7 @@ function handleSensorStatus(): {
       reading: null,
       age_seconds: null,
       recent_beep_echo: echo,
+      instance: `${INSTANCE_ID}@${BOOT_TIME}`,
     };
   }
   const age = (Date.now() - new Date(latestSensorReading.timestamp).getTime()) / 1000;
@@ -405,6 +407,7 @@ function handleSensorStatus(): {
     reading: latestSensorReading,
     age_seconds: Math.round(age),
     recent_beep_echo: echo,
+    instance: `${INSTANCE_ID}@${BOOT_TIME}`,
   };
 }
 
@@ -415,6 +418,16 @@ function handleSensorStatus(): {
  * yet. Undefined fields are dropped by JSON.stringify, so missing sensors
  * show up as absent keys.
  */
+// Process identity, stamped into every room snapshot and /sensor/status
+// response. If a stale bridge process is left serving traffic alongside a
+// new one, each accumulates its own sensor history and endpoints can
+// disagree about the recent past ("parallel universes"). Comparing the
+// `instance` field across two responses settles it in one request:
+// different values → find and kill the stale process; same value → suspect
+// a cache or proxy layer in front of the bridge instead.
+const INSTANCE_ID = Math.random().toString(36).slice(2, 8);
+const BOOT_TIME = new Date().toISOString();
+
 function currentRoom(): object | null {
   // Build the room snapshot from whatever we have: the latest sensor reading
   // (input side of the channel — environment + motion + biometric) AND the
@@ -426,7 +439,7 @@ function currentRoom(): object | null {
   const h = latestHapticEcho;
   if (!r && !e && !h) return null;
 
-  const room: Record<string, unknown> = {};
+  const room: Record<string, unknown> = { instance: `${INSTANCE_ID}@${BOOT_TIME}` };
   if (r) {
     Object.assign(room, r.environment ?? {});
     if (r.motion?.state)               room.motion          = r.motion.state;
