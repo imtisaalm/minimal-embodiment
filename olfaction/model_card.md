@@ -1,6 +1,60 @@
-# Model Card: Scent Classifier v0.1
+# Model Card: Scent Classifier
 
-## Model details
+## v0.2 — Neural Network (current)
+
+### Model details
+
+- **Type:** Fully connected neural network (PyTorch 2.8.0)
+- **Architecture:** 8 → 16 → 3 → 3, Dropout 0.3 after each ReLU
+- **Parameters:** 207
+- **Input:** 8 baseline-relative features from BME688 gas/humidity/temperature
+- **Output:** one of 3 classes — `baseline`, `fresh_plant`, `perfume`
+- **File:** `models/nn_3class_v0.2.json` (7.7 KB)
+
+### Intended use
+
+Real-time scent classification for a single BME688 sensor on an ESP32
+platform. The model runs inference in <1 ms from a JSON weight file
+loaded by a TypeScript module, with no external dependencies.
+
+### Training data
+
+46 samples from recordings collected 29 May – 17 July 2026:
+- 10 baseline (ambient air, independent recordings across two drift epochs)
+- 27 fresh_plant (lemon 9, orange 9, mint 9 — merged)
+- 9 perfume (Black Opium, Bluebell, Blackberry & Bay)
+
+Features are standardised to zero mean and unit variance; the scaler is
+exported with the model.
+
+### Evaluation
+
+Three-level group-aware cross-validation (mean ± std over 20 seeds):
+
+| Level | Groups | Accuracy | Balanced accuracy |
+|---|---|---|---|
+| Leave-one-out | 46 | 93.3% ± 2.5% | 91.8% ± 3.0% |
+| Leave-one-session-out | 36 | 94.0% ± 3.1% | 93.0% ± 4.4% |
+| Leave-one-date-out | 9 | 92.5% ± 4.7% | 90.1% ± 7.0% |
+
+### Limitations
+
+- Trained on data from a single sensor, single room, single operator.
+- Perfume data collected exclusively in May–June (no cross-epoch coverage).
+- Terpene-class VOCs (lemon, orange, mint) are indistinguishable by a
+  single MOX sensor and must be treated as one class.
+
+### Dependencies
+
+- Python 3.9.6
+- PyTorch 2.8.0
+- scikit-learn 1.6.1
+
+---
+
+## v0.1 — Random Forest
+
+### Model details
 
 - **Type:** RandomForestClassifier (scikit-learn 1.6.1)
 - **Parameters:** 400 trees, class_weight="balanced", random_state=0
@@ -8,25 +62,14 @@
 - **Output:** one of 3 classes — `baseline`, `orange`, `perfume`
 - **File:** `models/rf_orange_perfume_v0.1.joblib`
 
-## Intended use
-
-Proof-of-concept scent classification for a single BME688 sensor in a
-controlled indoor environment. Designed to demonstrate feasibility and
-establish a reliable small-sample evaluation methodology, not for
-production deployment.
-
-## Training data
+### Training data
 
 24 samples from recordings collected 29 May – 8 June 2026:
 - 12 baseline (ambient air, 3 independent sessions)
 - 3 orange (fresh orange, 3 separate days)
 - 9 perfume (Black Opium, Bluebell, Blackberry Bay)
 
-See `data/README.md` for feature definitions.
-
-## Evaluation
-
-Three-level group-aware cross-validation:
+### Evaluation
 
 | Level | Accuracy | Baseline recall |
 |---|---|---|
@@ -34,27 +77,8 @@ Three-level group-aware cross-validation:
 | Leave-one-session-out | 96% | 1.00 |
 | Leave-one-sitting-out | 100% | 1.00 |
 
-Stable accuracy across grouping levels indicates no session-level leakage.
-See `results/validation_summary.md` for full results.
+### Limitations
 
-## Limitations
-
-- Trained on data from a single sensor, single room, single operator.
 - Three classes only; no hard-negative or novelty detection.
-- Small sample size (n=24) — results indicate class separability, not
-  proven cross-environment generalisation.
-
-## How to load
-
-```python
-import joblib
-rf = joblib.load("models/rf_orange_perfume_v0.1.joblib")
-# Feature order: ['gas_trough_d', 'gas_mean_d', 'humid_peak_d', 'humid_mean_d', 'temp_d']
-```
-
-## Dependencies
-
-- Python 3.9.6
-- scikit-learn 1.6.1
-- numpy 2.0.2
-- pandas 2.3.3
+- Small sample size (n=24).
+- Single sensor, single room, single operator.

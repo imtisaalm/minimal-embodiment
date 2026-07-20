@@ -3,28 +3,50 @@
 Scent classification from BME688 gas-sensor signals on the
 [minimal self-perceiving embodiment](../) platform.
 
-A RandomForest classifier distinguishes three scent classes — **baseline**
-(ambient air), **orange**, and **perfume** — from five signed-delta
-features (gas resistance, humidity, temperature) computed relative to
-each recording's own baseline. Multi-level group-aware cross-validation
-(sample → session → sitting) yields **96–100% accuracy** with no
-detectable session-level leakage.
+## v0.2 — Neural Network (current)
 
-## Quick start
+A compact neural network (8→16→3→3, 207 parameters) classifies three
+scent classes — **baseline** (ambient air), **fresh_plant**
+(lemon/orange/mint merged), and **perfume** — from eight
+baseline-relative features. Lemon, orange, and mint all release
+terpene-class VOCs that produce overlapping responses on a single MOX
+element; normalising by baseline R₀ confirmed they are
+indistinguishable, so they are merged into one class.
+
+Three-level group-aware cross-validation (sample → session → date)
+yields **92–94% accuracy** across all levels, including leave-one-date-out
+which crosses a sensor-drift epoch. Results are mean ± std over 20 random
+seeds.
+
+| Level | Groups | Accuracy | Balanced accuracy |
+|---|---|---|---|
+| Leave-one-out | 46 | 93.3% ± 2.5% | 91.8% ± 3.0% |
+| Leave-one-session-out | 36 | 94.0% ± 3.1% | 93.0% ± 4.4% |
+| Leave-one-date-out | 9 | 92.5% ± 4.7% | 90.1% ± 7.0% |
 
 ```bash
 # Install dependencies
-pip install scikit-learn==1.6.1 pandas==2.3.3 numpy==2.0.2
+pip install torch scikit-learn pandas numpy
 
-# Train and evaluate
+# Evaluate (reproduces the table above)
+python src/evaluate_v0.2.py
+
+# Export model to JSON
+python src/export_nn.py
+```
+
+## v0.1 — Random Forest
+
+The initial classifier: a RandomForest distinguishing **baseline**,
+**orange**, and **perfume** from five signed-delta features (24 samples).
+Multi-level group-aware cross-validation (sample → session → sitting)
+yielded **96–100% accuracy**. See the `v1.0-paper` git tag for the
+corresponding code snapshot.
+
+```bash
+pip install scikit-learn==1.6.1 pandas numpy
 python src/train.py
-
-# Strictest evaluation (leave-one-sitting-out)
 python src/evaluate.py
-
-# Run validation checks
-python checks/check_data_leakage.py
-python checks/check_session_split.py
 ```
 
 ## Structure
@@ -32,46 +54,49 @@ python checks/check_session_split.py
 ```
 olfaction/
   README.md               ← you are here
-  model_card.md            ML model card (intended use, limitations)
+  model_card.md            ML model card (v0.1 + v0.2)
+
   data/
-    features.csv           24-sample feature table (signed-delta)
+    features.csv           24-sample feature table (v0.1, RF)
+    features_v0.2.csv      46-sample feature table (v0.2, NN)
     README.md              column definitions, collection protocol
+
   models/
-    rf_orange_perfume_v0.1.joblib   trained RandomForest model
+    rf_orange_perfume_v0.1.joblib   trained RF model (v0.1)
+    nn_3class_v0.2.json             trained NN model (v0.2, 7.7 KB)
+
   src/
-    extract_features.py    feature extraction from raw recordings
-    train.py               training + two-level cross-validation
-    evaluate.py            strictest evaluation (leave-one-sitting-out)
+    extract_features.py    feature extraction (v0.1)
+    train.py               RF training + two-level CV (v0.1)
+    evaluate.py            RF leave-one-sitting-out (v0.1)
+    extract_features_v0.2.py  feature extraction (v0.2, 10-min window)
+    evaluate_v0.2.py            NN three-level CV (v0.2)
+    export_nn.py              NN export to JSON (v0.2)
+
   results/
-    validation_summary.md  full results table + robustness analysis
-    feature_scatter.png    2D feature space visualisation
+    validation_summary.md  v0.1 results table
+    feature_scatter.png    v0.1 2D feature space visualisation
+
   checks/
-    check_data_leakage.py  LOO vs LOGO recall comparison
-    check_session_split.py confidence + noise-robustness checks
+    check_data_leakage.py  v0.1 LOO vs LOGO recall comparison
+    check_session_split.py v0.1 confidence + noise-robustness checks
 ```
 
-## Key design decisions
+## Key changes from v0.1 to v0.2
 
-1. **Deltas, not absolutes.** Features are changes relative to each
-   recording's own baseline, cancelling sensor drift by construction.
-2. **Fixed 13-minute window.** Every sample is measured over the same
-   duration, eliminating comparison bias from unequal recording lengths.
-3. **Three-level group-aware evaluation.** Sample-level CV is
-   insufficient for small sensor datasets — recordings share
-   environmental noise that inflates accuracy. Session-level and
-   sitting-level grouping expose this; stable accuracy across all three
-   levels indicates genuine odour discrimination.
-
-## Limitations and next steps
-
-This prototype demonstrates feasibility on 24 samples from a single
-sensor in one room. Extensions include:
-
-- Hard-negative classes (non-target odours that test discriminative
-  precision)
-- Novelty detection (abstaining on unfamiliar scents)
-- Cross-environment and cross-sensor generalisation
-- Real-time classification on the ESP32
+1. **Neural network replaces Random Forest** for real-time deployment
+   (<1 ms inference from a 7.7 KB JSON file, no dependencies).
+2. **Three terpene classes merged.** Lemon, orange, and mint are
+   indistinguishable on a single MOX element — all release terpene-class
+   VOCs and overlap completely in feature space.
+3. **Train/serve alignment.** Training and deployment now use the same
+   10-minute feature extraction window.
+4. **Date-level evaluation.** A new leave-one-date-out level exposes
+   class-date confounding that sub-date groupings cannot detect.
+5. **Drift diagnosis.** Alcohol appeared 100% separable from perfume on
+   absolute features, but only 56% (chance level) on drift-normalised
+   features — both produce the same reducing reaction on a single MOX
+   element.
 
 ## Citation
 

@@ -1129,10 +1129,9 @@ breadboard, tethered to USB. Things you might add:
 - **Phase 12: Vision.** ESP32-CAM + OV2640. The original plan; deferred
   in the reference build.
 - **Phase 13: Olfaction refinement.** A 3-class scent classifier
-  (baseline / orange / perfume) is included in `olfaction/` — see its
-  README and model card for details. Extensions: hard-negative classes,
-  novelty detection, cross-environment generalization, real-time
-  classification integrated into the bridge.
+  (baseline / fresh_plant / perfume) is included in `olfaction/` — see
+  its README and model card for details. Extensions: hard-negative
+  classes, novelty detection, cross-environment generalization.
 - **Phase 14: Portability.** Battery, enclosure, single-board form
   factor. Pick a wearable shape — wristband, pendant, pocket — and
   redesign accordingly.
