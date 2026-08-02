@@ -459,18 +459,16 @@ function currentRoom(): object | null {
     };
   }
   if (h) {
-    // Most recent haptic event + what the MPU felt during it. Extended
-    // fields (rms/floor/snr/felt) appear once the firmware reports them.
+    // The room snapshot carries the PERCEPT, not the lab notebook:
+    // "I felt it (felt), this clearly (snr), this hard (peak_g)."
+    // Full instrument statistics (rms, floor windows) stay on
+    // /haptic/echo — same collapse-at-the-edge principle as the
+    // firmware's still/walking and quiet/loud summaries.
     room.recent_haptic_echo = {
       effect_id: h.effect_id,
       peak_g: h.peak_g,
-      ...(h.rms !== undefined && {
-        rms: h.rms,
-        floor_peak: h.floor_peak,
-        floor_rms: h.floor_rms,
-        snr: h.snr,
-        felt: h.felt,
-      }),
+      ...(h.snr !== undefined && { snr: h.snr }),
+      ...(h.felt !== undefined && { felt: h.felt }),
       age_seconds: Math.round((Date.now() - new Date(h.timestamp).getTime()) / 1000),
     };
   }
