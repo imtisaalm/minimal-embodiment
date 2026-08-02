@@ -6,6 +6,14 @@
 // (no-motor) noise-floor probe, in randomized order interleaved across reps.
 // Saves raw JSONL plus per-table summary CSVs.
 //
+// Haptic echoes are measured fires: each trial carries its own pre-fire
+// control window, and the full statistics (AC peak/RMS for both windows,
+// snr = rms / floor_rms, and the bridge's `felt` verdict) are pulled from
+// /haptic/echo after the wait_echo confirms completion. felt_rate on the
+// baseline row is the false-positive rate. The audio loop protocol is
+// unchanged; note the firmware's mic chain includes a 200 Hz high-pass
+// filter, so ambient floors are lower than raw-mic datasets.
+//
 // Usage:
 //   export US_BRIDGE_TOKEN="..."          # bearer token the bridge accepts
 //   export US_BRIDGE_HOST="https://..."   # public HTTPS endpoint of the bridge
@@ -110,25 +118,55 @@ async function fireTrial(trial) {
     echo_waited: j.echo_waited === true,
   };
   const room = j.room || {};
+  // Room context for outlier forensics — a passing truck or a bump on
+  // the desk shows up here instead of staying a mystery in the stats.
+  if (Number.isFinite(room.noise_db)) out.ambient_db = room.noise_db;
 
   if (trial.kind === 'haptic') {
     out.effect_id = j.effect_id;
-    const e = room.recent_haptic_echo;
-    if (e && e.age_seconds === 0) out.peak_g = e.peak_g;
+    await pullFullEcho(out, j.effect_id);
   } else if (trial.kind === 'audio') {
     out.frequency = j.frequency;
     out.duration_ms = j.duration_ms;
     out.ambient_db = room.noise_db;
     const e = room.recent_beep_echo;
-    if (e && e.age_seconds === 0) out.echo_db = e.noise_db;
-  } else {
-    const e = room.recent_haptic_echo;
-    if (e && e.age_seconds === 0 && e.effect_id === 0) {
-      out.peak_g = e.peak_g;
+    // Attribution guard: recent AND matching tone. The frequency+duration
+    // pair is unique per named tone, so a stale echo from the previous
+    // trial can't masquerade as this one's.
+    if (
+      e && e.age_seconds <= 1 &&
+      e.frequency === j.frequency && e.duration_ms === j.duration_ms
+    ) {
+      out.echo_db = e.noise_db;
     }
+  } else {
+    await pullFullEcho(out, 0);
   }
 
   return out;
+}
+
+// The room snapshot deliberately carries only the percept (peak_g / snr /
+// felt); the full instrument statistics live on /haptic/echo. Pull them
+// from there after the wait_echo confirmed the measurement completed.
+//
+// Attribution guard: recent (≤1 s — the response can be built just after
+// the age bucket rolls over) AND matching effect id, so a late echo from
+// an earlier trial can never be credited to this one. The id match is
+// what makes the relaxed age window safe: trials are 2 s apart, and
+// within any 1 s window only one trial's id can match.
+async function pullFullEcho(out, expectedEffectId) {
+  const r = await fetch(`${HOST}/haptic/echo?token=${TOKEN}`);
+  if (r.status !== 200) return; // 204 = no echo yet
+  const j = await r.json();
+  const e = j.echo;
+  if (!e || j.age_seconds > 1 || e.effect_id !== expectedEffectId) return;
+  out.peak_g = e.peak_g;
+  out.rms = e.rms;
+  out.floor_peak = e.floor_peak;
+  out.floor_rms = e.floor_rms;
+  out.snr = e.snr;
+  out.felt = e.felt === true;
 }
 
 function quantile(sorted, q) {
@@ -158,20 +196,34 @@ function fmt(x, dp = 3) {
 }
 
 async function writeSummaries(results) {
-  // Haptic + baseline → loops_haptic.csv
+  // Haptic + baseline → loops_haptic.csv. Explicit statistic prefixes;
+  // snr is the headline, felt_rate on the baseline row is the
+  // false-positive rate.
   const hapticRows = [
-    'kind,name,effect_id,n,median,iqr_lo,iqr_hi,min,max',
+    'kind,name,effect_id,n,' +
+      'peak_median,peak_iqr_lo,peak_iqr_hi,' +
+      'rms_median,floor_rms_median,' +
+      'snr_median,snr_iqr_lo,snr_iqr_hi,snr_min,snr_max,' +
+      'felt_rate',
   ];
   const hapticOrder = [...HAPTIC_EFFECTS, 'baseline'];
   for (const name of hapticOrder) {
     const kind = name === 'baseline' ? 'baseline' : 'haptic';
     const rows = results.filter((r) => r.kind === kind && r.name === name);
-    const peaks = rows.map((r) => r.peak_g);
-    const s = summarize(peaks);
+    const peak = summarize(rows.map((r) => r.peak_g));
+    const rms = summarize(rows.map((r) => r.rms));
+    const floor = summarize(rows.map((r) => r.floor_rms));
+    const snr = summarize(rows.map((r) => r.snr));
+    const feltN = rows.filter((r) => r.felt === true).length;
+    const feltRate = snr.n > 0 ? feltN / snr.n : NaN;
     const eid = rows.find((r) => Number.isFinite(r.effect_id))?.effect_id ?? 0;
     hapticRows.push(
-      `${kind},${name},${eid},${s.n},${fmt(s.median)},${fmt(s.iqr_lo)},` +
-        `${fmt(s.iqr_hi)},${fmt(s.min)},${fmt(s.max)}`,
+      `${kind},${name},${eid},${snr.n},` +
+        `${fmt(peak.median)},${fmt(peak.iqr_lo)},${fmt(peak.iqr_hi)},` +
+        `${fmt(rms.median)},${fmt(floor.median)},` +
+        `${fmt(snr.median, 2)},${fmt(snr.iqr_lo, 2)},${fmt(snr.iqr_hi, 2)},` +
+        `${fmt(snr.min, 2)},${fmt(snr.max, 2)},` +
+        `${fmt(feltRate, 3)}`,
     );
   }
   await fs.writeFile(HAPTIC_CSV, hapticRows.join('\n') + '\n');
@@ -208,7 +260,9 @@ async function main() {
 
   const trials = buildTrials();
   const total = trials.length;
-  const estMin = Math.round((total * (INTER_MS / 1000 + 1.5)) / 60);
+  // Measured haptic trials spend ~2.2 s inside the measurement (floor +
+  // signal windows + echo round-trip); audio trials are unchanged.
+  const estMin = Math.round((total * (INTER_MS / 1000 + 2.2)) / 60);
   process.stderr.write(
     `Running ${total} trials (${HAPTIC_EFFECTS.length} haptic + ` +
       `${AUDIO_TONES.length} audio + 1 baseline) × ${N_REPS} reps. ` +

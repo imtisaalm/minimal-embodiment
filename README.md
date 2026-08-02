@@ -90,11 +90,15 @@ listed in the same comment.
 
 ## Reproducing §6.3 (self-perception loops)
 
-The original validation run is checked into `data/`:
+The current validation run is checked into `data/`, measured with the
+current firmware and measurement design. The run backing the paper's
+Tables 3–4 is preserved at the `v1.0-paper` tag — check that out first
+if you want to reproduce the paper's numbers exactly.
 
 - `data/loops_raw.jsonl` — 660 trial records (30 reps × 22 conditions)
-- `data/loops_haptic.csv` — per-effect summaries backing Table 4
-- `data/loops_audio.csv` — per-tone summaries backing Table 3
+- `data/loops_haptic.csv` — per-effect summaries (snr / felt_rate
+  schema; see Phase 7 of the build guide)
+- `data/loops_audio.csv` — per-tone echo/ambient summaries
 
 To reproduce on your own hardware:
 
@@ -108,7 +112,7 @@ node scripts/measure_loops.mjs
 ```
 
 The script runs 30 reps × 22 conditions (11 haptic + 10 audio + 1 baseline),
-randomized and interleaved, ~43 minutes total. Override the output directory
+randomized and interleaved, ~46 minutes total. Override the output directory
 with `US_OUTPUT_DIR=…` if you want to keep both runs side by side.
 
 ## Citation

@@ -119,6 +119,8 @@ on any single estimate.
 ### Toolchain
 
 - Arduino IDE (or PlatformIO) with the ESP32 board package installed
+  (tested on esp32 core 3.3.10 — the haptic-echo path includes
+  workarounds for I2C quirks observed on 3.x cores)
 - Required Arduino libraries: Wire, an I2C driver for your BME variant
   (BME280 or BME68x), BH1750, MPU6050, SSD1306 + GFX, DRV2605,
   ArduinoJson, HTTPClient. Search the Arduino Library Manager by chip
@@ -553,7 +555,7 @@ echo is 65–90 dB against an ambient floor of 35–45 dB.
   for the echo to clearly exceed ambient. For a more dramatic
   signal-to-noise, try a higher buzzer frequency (3000+ Hz).
 - **`wait_echo=true` times out** — bridge holds the response up to
-  ~4000 ms waiting for the firmware to report back via
+  the tone length + ~6 s waiting for the firmware to report back via
   `/command/poll`. If the firmware isn't reaching the bridge (WiFi
   drop, ESP32 crash), the wait times out and the response returns
   without echo data. Check the firmware's serial monitor.
@@ -580,12 +582,19 @@ this loop closes for someone tends to be loud.
 No new wiring — physical re-mounting of the existing motor.
 
 ### Code
-- Firmware temporarily reconfigures MPU-6050 to wide-band mode (260 Hz
-  LP, ±4 g range) for the haptic-echo sample window only, then restores
-  the normal motion-classification config.
-- New parameter: `GET /haptic?effect=...&wait_echo=true` — bridge holds
-  response until firmware reports the peak |a−g| in m/s² it felt during
-  the haptic.
+- Every measured haptic carries its own control: the firmware samples a
+  floor window immediately before firing, then a signal window that
+  opens at the moment of `drv.go()`. Both windows are taken in a
+  temporary wide-band MPU configuration (260 Hz LP filter) and report
+  peak and RMS of the AC deviation from the window's own mean.
+- The bridge derives `snr = rms / floor_rms` and a boolean `felt` —
+  true when either statistic exceeds 3× the same echo's own floor.
+- `GET /haptic?effect=...&wait_echo=true` selects the measured path and
+  holds the response until the echo returns. Plain calls without
+  `wait_echo` fire immediately and skip measurement entirely.
+- Measurement runs in the firmware's main loop with PWR_MGMT_1 re-pokes
+  — recent ESP32 cores corrupt MPU reads after a DRV2605 write (see the
+  comment block in the sketch).
 
 ### How to know it worked
 
@@ -594,21 +603,53 @@ curl -H "Authorization: Bearer $US_BRIDGE_TOKEN" \
   "http://localhost:3737/haptic?effect=alert&wait_echo=true"
 ```
 
-`recent_haptic_echo.peak_g` returns 7–40 m/s² for clearly-felt effects,
-vs an ambient floor of ~0.01 m/s². Note: `peak_g` is a legacy field
-name. Despite the name, the value is reported in m/s² (peak |a − g|
-with gravity subtracted), not in units of g. See §6.3 of the paper for
-the full validation across all 11 named effects.
+The response's `recent_haptic_echo` carries the percept — typical
+values for `alert` on a still desk:
+
+```json
+"recent_haptic_echo": {
+  "effect_id": 58,
+  "peak_g": 17.8,
+  "snr": 81.3,
+  "felt": true,
+  "age_seconds": 0
+}
+```
+
+Baseline probes (`GET /haptic/baseline?wait_echo=true`, motor never
+fired) report `snr` ≈ 1 (IQR 1.00–1.11 over 30 reps) and
+`felt: false`. Every named effect reports `felt: true`, with median
+`snr` ranging from ~7 (`hello`, a 10 ms tick) to ~84 (`alert`). The
+full validation across all 11 named effects is checked into
+`data/loops_haptic.csv`; the full instrument statistics behind these
+numbers (window RMS and the pre-fire floor) are available on
+`/haptic/echo` (see the API reference).
+
+Note: `peak_g` is a legacy field name. Despite the name, the value is
+reported in m/s² — the peak AC deviation of the acceleration magnitude
+from the window's own mean, not in units of g. At the default ±2g
+accelerometer range, peak values above ~18 m/s² are range-limited lower
+bounds — strong effects saturate the accelerometer axes; detection
+(`snr`/`felt`) is unaffected.
+
+The measurement design and dataset behind the original paper are
+preserved at the `v1.0-paper` tag.
 
 ### If something went wrong
-- **Peak readings are tiny (< 0.5 m/s²) even for `alert`** — motor
-  mounting too tight. Loosen until the motor can wobble freely; the
-  difference is dramatic (we measured 0.46 vs 7.90 m/s² across mountings
-  of the same effect).
+- **`snr` stays ≈ 1 even for `alert`** — motor mounting too tight.
+  Loosen until the motor can wobble freely; the difference across
+  mountings of the same effect is dramatic.
+- **Serial log shows `haptic echo invalid: … plausible`** — the MPU
+  returned implausible near-zero readings mid-window, usually the
+  DRV2605-write corruption on recent cores. The sketch's PWR_MGMT_1
+  re-poke handles it; if the message persists, check the I2C wiring.
+- **`felt: true` on a baseline** — something moved the desk during the
+  ~500 ms signal window (a keystroke, a bump). Baselines assume a still
+  surface.
 - **Default-mode MPU sees nothing** — expected. The default 21 Hz LP
   filter is well below the ERM's 150–250 Hz vibration band; the
-  wide-band reconfiguration during the sample window is what makes the
-  haptic visible.
+  wide-band reconfiguration during the measurement windows is what
+  makes the haptic visible.
 
 ### Milestone
 
@@ -875,8 +916,10 @@ Two input shapes:
   `heartbeat`, `knock`, `hello`, `alert`.
 - `effect_id=<N>` — raw DRV2605L library ID (1–123).
 
-Optional `wait_echo=true` — bridge holds the response until the
-firmware reports back the peak |a−g| in m/s² it felt during the haptic.
+Optional `wait_echo=true` — selects the measured path: the firmware
+samples a pre-fire control window, fires, samples a signal window, and
+the response's `recent_haptic_echo` reports `peak_g`, `snr`, and
+`felt`.
 
 ### `/beep/echo`
 
@@ -896,26 +939,32 @@ during the last beep. Returns 204 if no beep has been played yet.
 
 ### `/haptic/echo`
 
-Returns the most recent haptic self-perception echo — the peak
-acceleration the MPU-6050 measured during the last haptic effect.
-Returns 204 if no haptic has been fired yet.
+Returns the most recent haptic self-perception echo with the full
+measurement statistics — signal-window peak/RMS plus the pre-fire
+control window that anchors them. Returns 204 if no measured haptic
+has run yet.
 
 ```json
 {
   "has_echo": true,
-  "echo": { "effect_id": 1, "peak_g": 0.35 },
+  "echo": {
+    "effect_id": 58,
+    "peak_g": 17.8, "rms": 3.3,
+    "floor_peak": 0.11, "floor_rms": 0.042,
+    "snr": 81.3, "felt": true
+  },
   "age_seconds": 3
 }
 ```
 
-Note: `peak_g` is a legacy field name. The value is in m/s² (peak
-|a − g| with gravity subtracted), not in units of g.
+Note: `peak_g` is a legacy field name. The value is in m/s² — the peak
+AC deviation of the acceleration magnitude — not in units of g.
 
 ### `/haptic/baseline`
 
 Queues a noise-floor measurement: the ESP32 runs the same wide-band MPU
 sampling as a real haptic echo, but skips the motor. Result lands in
-`/haptic/echo` with `effect_id=0`. Useful for characterizing
+`/haptic/echo` with `effect_id=0` and `snr` ≈ 1 by construction. Useful for characterizing
 accelerometer noise without moving hardware. Accepts optional
 `wait_echo=true`.
 
