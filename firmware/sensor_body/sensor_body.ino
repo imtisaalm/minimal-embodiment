@@ -476,9 +476,14 @@ const char* sampleMotionState(float& outStddev) {
 
 // ---- NOISE LEVEL HELPER -------------------------------------------------
 //
-// Read MIC_READ_SAMPLES samples from the I2S DMA buffer, compute the RMS of
-// the AC component (DC-blocked), and convert to dB SPL using the INMP441
-// datasheet sensitivity rating: -26 dBFS at 94 dB SPL.
+// Read MIC_READ_SAMPLES samples from the I2S DMA buffer, high-pass filter
+// them, compute the RMS, and convert to dB SPL using the INMP441 datasheet
+// sensitivity rating: -26 dBFS at 94 dB SPL.
+//
+// The high-pass stage (two cascaded first-order IIR sections, fc ≈ 200 Hz
+// at 16 kHz) removes 50/100 Hz mains interference that couples into the
+// mic through breadboard wiring — without it, a quiet room can read
+// ~10 dB high on hum alone. It also takes care of DC bias.
 //
 // Same shape as sampleMotionState: a continuous signal collapsed to ONE
 // number for the bridge, plus an enum classification ("quiet"/"moderate"/
@@ -498,18 +503,27 @@ float readMicNoiseDb() {
 
   // INMP441 outputs 24-bit two's complement, left-aligned in a 32-bit slot.
   // Right-shift by 8 sign-extends to a normal 24-bit signed integer.
-  // Compute mean (DC bias) and sum-of-squares in one pass; subtract DC so
-  // any constant offset doesn't inflate the RMS reading.
-  double sum = 0.0, sumSq = 0.0;
+  //
+  // Two-stage cascaded IIR high-pass filter (fc ≈ 200 Hz at 16 kHz).
+  // α = fs / (fs + 2π·fc) = 16000 / (16000 + 1257) ≈ 0.927
+  // The first SETTLE samples are excluded from the RMS while the filter
+  // state converges.
+  const double alpha = 0.927;
+  double y1 = 0.0, xPrev1 = (double)(samples[0] >> 8);
+  double y2 = 0.0, yPrev1 = 0.0;
+  double sumSq = 0.0;
+  const int SETTLE = 128;
   for (int i = 0; i < n; i++) {
-    int32_t s = samples[i] >> 8;
-    sum   += (double)s;
-    sumSq += (double)s * (double)s;
+    double x = (double)(samples[i] >> 8);
+    y1 = alpha * (y1 + x - xPrev1);     // stage 1
+    xPrev1 = x;
+    y2 = alpha * (y2 + y1 - yPrev1);    // stage 2
+    yPrev1 = y1;
+    if (i >= SETTLE) sumSq += y2 * y2;
   }
-  double mean = sum / n;
-  double variance = (sumSq / n) - (mean * mean);
-  if (variance < 0.0) variance = 0.0;        // numeric guard
-  double rms = sqrt(variance);
+  int nValid = n - SETTLE;
+  if (nValid <= 0) return NAN;
+  double rms = sqrt(sumSq / nValid);
   if (rms < 1.0) rms = 1.0;                  // avoid log(0)
 
   // dBFS = 20*log10(rms / fullScale); dBSPL = dBFS + 120 (since the INMP441
