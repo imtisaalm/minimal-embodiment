@@ -465,7 +465,9 @@ function currentRoom(): object | null {
     // /haptic/echo — same collapse-at-the-edge principle as the
     // firmware's still/walking and quiet/loud summaries.
     room.recent_haptic_echo = {
-      effect_id: h.effect_id,
+      ...(h.effect !== undefined
+        ? { effect: h.effect }
+        : { effect_id: h.effect_id }),
       peak_g: h.peak_g,
       ...(h.snr !== undefined && { snr: h.snr }),
       ...(h.felt !== undefined && { felt: h.felt }),
@@ -613,6 +615,10 @@ async function handleCommandPoll(
       effect_id: hechoEffect,
       peak_g: hechoPeak,
     };
+    if (pendingMeasuredFire && pendingMeasuredFire.effect_id === hechoEffect) {
+      echo.effect = pendingMeasuredFire.name;
+      pendingMeasuredFire = null;
+    }
     // Extended statistics, when the firmware sends them. The verdict
     // compares each window against the echo's OWN pre-fire floor: RMS
     // catches sustained vibration (noise averages down by √N, signal
@@ -673,6 +679,7 @@ function handleBeepEcho(): {
 type HapticEcho = {
   timestamp: string;
   effect_id: number;
+  effect?: string;      // semantic name of the measured fire, when known
   peak_g: number;       // peak AC deviation in m/s², signal window
   // Extended statistics. Absent when the firmware reports only the peak.
   rms?: number;         // RMS AC deviation, signal window
@@ -683,6 +690,15 @@ type HapticEcho = {
 };
 
 let latestHapticEcho: HapticEcho | null = null;
+
+// The firmware's echo carries only the numeric effect id, but ids are
+// shared between semantic aliases (heartbeat and double_tap are both 10)
+// — and "I felt heartbeat" is a different percept from "I felt
+// double_tap" even when the motor waveform is identical. Remember the
+// name of the most recent measured fire and attach it to the echo ONLY
+// when the id matches — better an unnamed echo than a mislabeled one.
+// Raw effect_id fires have no name and report the number instead.
+let pendingMeasuredFire: { effect_id: number; name: string } | null = null;
 
 function handleHapticEcho(): {
   has_echo: boolean;
@@ -776,6 +792,12 @@ async function handleHaptic(args: unknown): Promise<{
   // Mark "now" BEFORE queueing so we can detect when the echo for THIS
   // haptic event (vs. a previous one still in latestHapticEcho) lands.
   const queuedAt = Date.now();
+  if (wantEcho) {
+    pendingMeasuredFire = {
+      effect_id: effectId,
+      name: resolvedName ?? String(effectId),
+    };
+  }
   queueCommand({
     type: "haptic",
     effect_id: effectId,
@@ -823,6 +845,7 @@ async function handleHapticBaseline(args: unknown): Promise<{
   room: object | null;
 }> {
   const queuedAt = Date.now();
+  pendingMeasuredFire = { effect_id: 0, name: "baseline" };
   queueCommand({ type: "haptic_baseline" });
 
   const wantEcho = isTruthyParam(getField(args, "wait_echo"));

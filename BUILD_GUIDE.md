@@ -608,7 +608,7 @@ values for `alert` on a still desk:
 
 ```json
 "recent_haptic_echo": {
-  "effect_id": 58,
+  "effect": "alert",
   "peak_g": 17.8,
   "snr": 81.3,
   "felt": true,
@@ -918,8 +918,8 @@ Two input shapes:
 
 Optional `wait_echo=true` — selects the measured path: the firmware
 samples a pre-fire control window, fires, samples a signal window, and
-the response's `recent_haptic_echo` reports `peak_g`, `snr`, and
-`felt`.
+the response's `recent_haptic_echo` reports the effect name, `peak_g`,
+`snr`, and `felt`.
 
 ### `/beep/echo`
 
@@ -948,7 +948,7 @@ has run yet.
 {
   "has_echo": true,
   "echo": {
-    "effect_id": 58,
+    "effect": "alert", "effect_id": 58,
     "peak_g": 17.8, "rms": 3.3,
     "floor_peak": 0.11, "floor_rms": 0.042,
     "snr": 81.3, "felt": true
