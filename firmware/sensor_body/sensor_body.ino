@@ -549,54 +549,153 @@ void fireHaptic(int effectId) {
 
 // Haptic echo via MPU during haptic firing.
 //
-// The default MPU configuration in setup() (21 Hz low-pass filter, 100 Hz
-// sampling) is tuned for human-scale motion classification (still / walking /
-// running). ERM coin motors vibrate at ~150-250 Hz, which is invisible to
-// that configuration: the LP filter attenuates the band, and 100 Hz sampling
-// is below Nyquist for the vibration frequency. To detect haptic output via
-// the accelerometer, we briefly switch the MPU into a wide-band, fast-sample
-// mode for the duration of one ~64 ms window, then switch back.
+// Design: every echo carries its own control. A floor window is sampled
+// immediately BEFORE the motor fires (same MPU config, same statistics),
+// then the signal window starts right at drv.go() and is long enough to
+// hold both click transients and the body of buzz-class effects. Both
+// windows report peak and RMS of the AC deviation — magnitude minus the
+// window's own mean, so calibration bias and tilt cancel. Peak catches
+// ~10 ms click transients; RMS integrates sustained vibration and
+// averages sensor noise down by ~√N.
 //
-// We expose peak |a − g| in m/s² rather than RMS — for a brief vibration
-// burst the peak is more diagnostic than the RMS, and it is the value that
-// most closely answers "did the chip see the motor go off?"
+// Timing matters: most DRV2605 library effects finish within ~200 ms,
+// so any fixed post-fire sampling delay would measure silence for short
+// effects and scheduler luck for long ones — the window must open at
+// the moment of firing.
+//
+// The bridge combines the statistics into snr = rms / floor_rms and a
+// boolean verdict `felt`. A baseline run (motor never fired) reports
+// snr ≈ 1 by construction.
+//
+// Recent Arduino ESP32 cores (observed on 3.3.10) have two I2C quirks
+// this code works around: (a) mpu.begin() can leave the chip in SLEEP,
+// and (b) a DRV2605 write corrupts subsequent MPU reads until
+// PWR_MGMT_1 is re-poked. Sampling therefore runs in loop() context and
+// re-wakes the MPU before each window; physically impossible readings
+// (|a| < 2 m/s²) are dropped so they cannot poison the statistics.
 
 struct HapticEcho {
   bool   valid;
   int    effect_id;
-  float  peak_g;     // peak |a − g| in m/s² during the sample window
+  float  peak_g;       // peak AC deviation in m/s², signal window
+  float  rms;          // RMS AC deviation in m/s², signal window
+  float  floor_peak;   // same statistics, pre-fire control window
+  float  floor_rms;
 };
-volatile HapticEcho lastHapticEcho = { false, 0, 0.0f };
+volatile HapticEcho lastHapticEcho = { false, 0, 0.0f, 0.0f, 0.0f, 0.0f };
 
-float hapticEchoSample() {
-  if (!mpuOk) return NAN;
+// commandPollTask hands the whole measured-fire choreography (floor
+// window → fire → signal window) to loop() via this flag.
+volatile bool echoRequest = false;
+volatile int  echoRequestEffectId = 0;
 
-  // Switch to wide-band, wide-range config for haptic detection.
-  mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  delay(5);  // let the LP filter settle to new cutoff
+// Windows are sample counts, not milliseconds: each mpu.getEvent() is
+// I2C-bound (~1-2 ms) plus delay(1). The serial log prints wall time.
+const int HECHO_FLOOR_N = 48;    // pre-fire control window
+const int HECHO_WIN_N   = 192;   // signal window
+static float hechoBuf[HECHO_WIN_N];  // reused for both windows
 
-  // Sample as fast as Wire allows; 64 reads × ~1 ms each ≈ 64 ms window.
-  const int N = 64;
-  const float G = 9.80665f;
-  float maxDev = 0.0f;
-  for (int i = 0; i < N; i++) {
+// Re-poke PWR_MGMT_1 — needed before every sampling burst and again
+// after any DRV2605 write (see the core-quirk note above).
+static void wakeMpu(int settleMs) {
+  Wire.beginTransmission(0x68);
+  Wire.write(0x6B);  // PWR_MGMT_1
+  Wire.write(0x00);  // clear SLEEP
+  Wire.endTransmission();
+  if (settleMs > 0) delay(settleMs);
+}
+
+// Fill buf with up to n acceleration magnitudes; returns how many were
+// physically plausible (|a| >= 2 m/s²; all-zero reads are corruption,
+// impossible at rest under gravity).
+static int sampleMagWindow(float* buf, int n) {
+  int valid = 0;
+  for (int i = 0; i < n; i++) {
     sensors_event_t a, g, t;
     mpu.getEvent(&a, &g, &t);
     float ax = a.acceleration.x;
     float ay = a.acceleration.y;
     float az = a.acceleration.z;
     float mag = sqrtf(ax * ax + ay * ay + az * az);
-    float dev = fabsf(mag - G);
-    if (dev > maxDev) maxDev = dev;
+    if (mag >= 2.0f) buf[valid++] = mag;
     delay(1);
   }
+  return valid;
+}
 
-  // Restore the human-motion-detection config used by sampleMotionState().
+// Peak and RMS of the deviation from the window's own mean. RMS is
+// unaffected by the |·| fold (squaring), and mean-subtraction makes a
+// quiet window read pure sensor noise regardless of MPU offset or tilt.
+static void acStats(const float* buf, int n, float* outPeak, float* outRms) {
+  float sum = 0.0f;
+  for (int i = 0; i < n; i++) sum += buf[i];
+  const float mean = sum / n;
+  float maxDev = 0.0f;
+  float sumSq  = 0.0f;
+  for (int i = 0; i < n; i++) {
+    const float dev = buf[i] - mean;
+    const float ad  = fabsf(dev);
+    if (ad > maxDev) maxDev = ad;
+    sumSq += dev * dev;
+  }
+  *outPeak = maxDev;
+  *outRms  = sqrtf(sumSq / n);
+}
+
+// The measured-fire choreography. Runs in loop() context ONLY (see the
+// core-quirk note). effectId 0 = baseline: identical flow, motor never
+// fired. If the MPU is offline the motor still fires; the tap should
+// land even when it cannot be measured.
+void hapticEchoMeasure(int effectId) {
+  if (!mpuOk) {
+    if (effectId > 0) fireHaptic(effectId);
+    return;
+  }
+
+  wakeMpu(10);
+  mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
+  delay(5);  // let the LP filter settle to the new cutoff
+
+  // 1. Control window — this echo's own noise floor.
+  int floorN = sampleMagWindow(hechoBuf, HECHO_FLOOR_N);
+  float floorPeak = 0.0f, floorRms = 0.0f;
+  bool floorOk = floorN >= HECHO_FLOOR_N / 2;
+  if (floorOk) acStats(hechoBuf, floorN, &floorPeak, &floorRms);
+
+  // 2. Fire, re-wake (the DRV write just corrupted the MPU again), and
+  //    sample immediately. wakeMpu(2) costs ~4 ms — the head of a click
+  //    transient; the body of it and everything sustained lands
+  //    in-window.
+  if (effectId > 0) {
+    fireHaptic(effectId);
+    wakeMpu(2);
+  }
+  const unsigned long t0 = millis();
+  int winN = sampleMagWindow(hechoBuf, HECHO_WIN_N);
+  const unsigned long winMs = millis() - t0;
+
+  // Restore the narrow-band config used by motion classification.
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
 
-  return maxDev;
+  if (!floorOk || winN < HECHO_WIN_N / 2) {
+    Serial.printf("[cmd] haptic echo invalid: %d/%d floor, %d/%d win plausible\n",
+                  floorN, HECHO_FLOOR_N, winN, HECHO_WIN_N);
+    return;
+  }
+
+  float peak = 0.0f, rms = 0.0f;
+  acStats(hechoBuf, winN, &peak, &rms);
+
+  lastHapticEcho.effect_id  = effectId;
+  lastHapticEcho.peak_g     = peak;
+  lastHapticEcho.rms        = rms;
+  lastHapticEcho.floor_peak = floorPeak;
+  lastHapticEcho.floor_rms  = floorRms;
+  lastHapticEcho.valid      = true;
+  Serial.printf(
+      "[cmd] haptic %s%d: peak=%.3f rms=%.3f | floor peak=%.3f rms=%.3f | win=%lums (%d smp)\n",
+      effectId == 0 ? "baseline " : "effect ", effectId, peak, rms, floorPeak,
+      floorRms, winMs, winN);
 }
 
 // ---- FACE RENDERING -----------------------------------------------------
@@ -970,6 +1069,11 @@ void commandPollTask(void* param) {
     if (lastHapticEcho.valid) {
       url += "&hecho_effect=";     url += lastHapticEcho.effect_id;
       url += "&hecho_peak=";       url += String(lastHapticEcho.peak_g, 3);
+      // Extended echo statistics — the bridge computes snr + felt from
+      // these. Older bridges simply ignore the extra params.
+      url += "&hecho_rms=";        url += String(lastHapticEcho.rms, 3);
+      url += "&hecho_floor_peak="; url += String(lastHapticEcho.floor_peak, 3);
+      url += "&hecho_floor_rms=";  url += String(lastHapticEcho.floor_rms, 3);
       lastHapticEcho.valid = false;
     }
 
@@ -984,41 +1088,44 @@ void commandPollTask(void* param) {
 
       if (type == "haptic") {
         int effectId = extractJsonInt(body, "effect_id");
+        // "echo":1 marks a measured fire (the bridge sets it for
+        // wait_echo requests). Plain taps skip the whole measurement
+        // dance: fire right here, right now — lowest latency.
+        int wantEcho = extractJsonInt(body, "echo");
         if (effectId > 0) {
-          fireHaptic(effectId);
-          // Sample MPU during the haptic to confirm it physically
-          // registered. Wait 200 ms for the motor to spin up, then take a
-          // 64 ms wide-band peak read. Total ~270 ms inside the ~1 s
-          // effect window for the longer ERM patterns.
-          vTaskDelay(pdMS_TO_TICKS(200));
-          float peakG = hapticEchoSample();
-          if (!isnan(peakG)) {
-            lastHapticEcho.effect_id = effectId;
-            lastHapticEcho.peak_g    = peakG;
-            lastHapticEcho.valid     = true;
-            Serial.printf("[cmd] haptic effect %d, MPU peak |a-g|=%.3f m/s^2\n",
-                          effectId, peakG);
+          if (wantEcho == 1) {
+            // Measured fire: loop() runs floor window → fire → signal
+            // window (MPU sampling only works there; see the core-quirk
+            // note). Wait for it so the echo rides the very next poll.
+            echoRequestEffectId = effectId;
+            echoRequest = true;
+            unsigned long deadline = millis() + 3000;
+            while (echoRequest && millis() < deadline) {
+              vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            if (!echoRequest && lastHapticEcho.valid) {
+              Serial.printf("[cmd] haptic effect %d measured\n", effectId);
+            } else {
+              Serial.printf("[cmd] haptic effect %d (echo timeout or MPU offline)\n",
+                            effectId);
+            }
           } else {
-            Serial.printf("[cmd] haptic effect %d (no MPU echo: MPU offline)\n",
-                          effectId);
+            fireHaptic(effectId);
+            Serial.printf("[cmd] haptic effect %d\n", effectId);
           }
         }
       } else if (type == "haptic_baseline") {
-        // Noise-floor measurement: identical timing and sampling to a real
-        // haptic echo, but the motor is NOT fired. Lets us measure the
-        // accelerometer noise floor of the haptic-echo path under exactly
-        // the same wide-band reconfiguration the real measurements use.
-        // effect_id=0 in the echo denotes a baseline reading.
-        vTaskDelay(pdMS_TO_TICKS(200));
-        float peakG = hapticEchoSample();
-        if (!isnan(peakG)) {
-          lastHapticEcho.effect_id = 0;
-          lastHapticEcho.peak_g    = peakG;
-          lastHapticEcho.valid     = true;
-          Serial.printf("[cmd] haptic baseline, MPU peak |a-g|=%.3f m/s^2\n",
-                        peakG);
+        // Baselines are always measured — that's their whole point.
+        echoRequestEffectId = 0;
+        echoRequest = true;
+        unsigned long deadline = millis() + 3000;
+        while (echoRequest && millis() < deadline) {
+          vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (!echoRequest && lastHapticEcho.valid) {
+          Serial.printf("[cmd] haptic baseline measured\n");
         } else {
-          Serial.println("[cmd] haptic baseline (no MPU echo: MPU offline)");
+          Serial.println("[cmd] haptic baseline (echo timeout or MPU offline)");
         }
       } else if (type == "face") {
         String name = extractJsonString(body, "expression");
@@ -1070,6 +1177,16 @@ void commandPollTask(void* param) {
 // ---- LOOP ----------------------------------------------------------------
 
 void loop() {
+  // Measured haptic fire — commandPollTask handed us the whole
+  // choreography (floor window → fire → signal window). MPU wake-poking
+  // and bandwidth switching live inside hapticEchoMeasure(). The flag is
+  // cleared unconditionally so a dead MPU can't wedge the poll task's
+  // spin-wait forever.
+  if (echoRequest) {
+    hapticEchoMeasure(echoRequestEffectId);
+    echoRequest = false;
+  }
+
   // Reconnect WiFi if dropped
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[wifi] reconnecting...");

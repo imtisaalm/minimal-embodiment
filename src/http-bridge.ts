@@ -459,10 +459,18 @@ function currentRoom(): object | null {
     };
   }
   if (h) {
-    // Same shape: most recent haptic event + what the MPU peak was during it.
+    // Most recent haptic event + what the MPU felt during it. Extended
+    // fields (rms/floor/snr/felt) appear once the firmware reports them.
     room.recent_haptic_echo = {
       effect_id: h.effect_id,
       peak_g: h.peak_g,
+      ...(h.rms !== undefined && {
+        rms: h.rms,
+        floor_peak: h.floor_peak,
+        floor_rms: h.floor_rms,
+        snr: h.snr,
+        felt: h.felt,
+      }),
       age_seconds: Math.round((Date.now() - new Date(h.timestamp).getTime()) / 1000),
     };
   }
@@ -486,7 +494,11 @@ function currentRoom(): object | null {
 // than the microcontroller can drain, the oldest commands get dropped —
 // losing the middle of a rapid-fire sequence is less bad than stalling.
 type PendingCommand =
-  | { type: "haptic"; effect_id: number }
+  // `echo: 1` marks a measured fire: the firmware routes it through the
+  // loop()-context choreography (floor window → fire → signal window)
+  // and reports the full echo statistics back. Plain taps omit it and
+  // fire instantly in the poll task with zero measurement overhead.
+  | { type: "haptic"; effect_id: number; echo?: number }
   | { type: "haptic_baseline" }
   | { type: "face"; expression: string }
   | { type: "beep"; frequency: number; duration_ms: number };
@@ -576,11 +588,31 @@ async function handleCommandPoll(args: unknown): Promise<PendingCommand | null> 
   const hechoEffect = asOptionalNumber(getField(args, "hecho_effect"));
   const hechoPeak = asOptionalNumber(getField(args, "hecho_peak"));
   if (hechoEffect !== undefined && hechoPeak !== undefined) {
-    latestHapticEcho = {
+    const echo: HapticEcho = {
       timestamp: new Date().toISOString(),
       effect_id: hechoEffect,
       peak_g: hechoPeak,
     };
+    // Extended statistics, when the firmware sends them. The verdict
+    // compares each window against the echo's OWN pre-fire floor: RMS
+    // catches sustained vibration (noise averages down by √N, signal
+    // doesn't), peak catches ~10 ms click transients that RMS would
+    // dilute. 3× is far outside both statistics' sampling variation.
+    const rms = asOptionalNumber(getField(args, "hecho_rms"));
+    const floorPeak = asOptionalNumber(getField(args, "hecho_floor_peak"));
+    const floorRms = asOptionalNumber(getField(args, "hecho_floor_rms"));
+    if (rms !== undefined && floorPeak !== undefined && floorRms !== undefined) {
+      echo.rms = rms;
+      echo.floor_peak = floorPeak;
+      echo.floor_rms = floorRms;
+      if (floorRms > 0) {
+        echo.snr = Math.round((rms / floorRms) * 100) / 100;
+      }
+      echo.felt =
+        (floorRms > 0 && rms > 3 * floorRms) ||
+        (floorPeak > 0 && hechoPeak > 3 * floorPeak);
+    }
+    latestHapticEcho = echo;
   }
 
   // `wait` is seconds, clamped [1, 30]. Default 25 — shorter than the 30s
@@ -621,7 +653,13 @@ function handleBeepEcho(): {
 type HapticEcho = {
   timestamp: string;
   effect_id: number;
-  peak_g: number;       // peak |a − g| in m/s² during the sample window
+  peak_g: number;       // peak AC deviation in m/s², signal window
+  // Extended statistics. Absent when the firmware reports only the peak.
+  rms?: number;         // RMS AC deviation, signal window
+  floor_peak?: number;  // same statistics, pre-fire control window
+  floor_rms?: number;
+  snr?: number;         // rms / floor_rms — how far above its own floor
+  felt?: boolean;       // verdict: did the MPU actually register it?
 };
 
 let latestHapticEcho: HapticEcho | null = null;
@@ -708,25 +746,28 @@ async function handleHaptic(args: unknown): Promise<{
     );
   }
 
+  // Mirror of /beep's wait_echo: opt-in synchronous mode that blocks the
+  // response until the haptic-echo for THIS event arrives back from the
+  // microcontroller. wait_echo also selects the measured-fire path
+  // (echo: 1) — plain taps skip measurement entirely and fire with the
+  // lowest possible latency.
+  const wantEcho = isTruthyParam(getField(args, "wait_echo"));
+
   // Mark "now" BEFORE queueing so we can detect when the echo for THIS
   // haptic event (vs. a previous one still in latestHapticEcho) lands.
   const queuedAt = Date.now();
-  queueCommand({ type: "haptic", effect_id: effectId });
+  queueCommand({
+    type: "haptic",
+    effect_id: effectId,
+    ...(wantEcho ? { echo: 1 } : {}),
+  });
 
-  // Mirror of /beep's wait_echo: opt-in synchronous mode that blocks the
-  // response until the haptic-echo for THIS event arrives back from the
-  // ESP32. Cost: ~500-1500 ms added to the response, depending on long-poll
-  // alignment. Default off so the existing fire-and-forget behavior is
-  // unchanged.
-  const wantEcho = isTruthyParam(getField(args, "wait_echo"));
   let echoWaited = false;
   if (wantEcho) {
-    // 4 s budget covers: ESP32 long-poll dispatch + haptic firing
-    // (~50 ms) + 200 ms motor spin-up wait + 64 ms accelerometer sample
-    // + next-poll TLS handshake (~50-200 ms) + bridge update. Best case
-    // ~400 ms; this leaves headroom for reconnect or backoff after a
-    // recent bridge restart.
-    const maxWaitMs = 4000;
+    // 8 s budget: worst case has the firmware's main loop inside its
+    // 10 s sensor post when the fire arrives, plus the ~700 ms
+    // measurement, plus the echo riding the NEXT poll's TLS handshake.
+    const maxWaitMs = 8000;
     const checkIntervalMs = 100;
     const deadline = queuedAt + maxWaitMs;
     while (Date.now() < deadline) {
@@ -767,7 +808,8 @@ async function handleHapticBaseline(args: unknown): Promise<{
   const wantEcho = isTruthyParam(getField(args, "wait_echo"));
   let echoWaited = false;
   if (wantEcho) {
-    const maxWaitMs = 4000;
+    // Same 8 s budget as /haptic — see the comment there.
+    const maxWaitMs = 8000;
     const checkIntervalMs = 100;
     const deadline = queuedAt + maxWaitMs;
     while (Date.now() < deadline) {
@@ -925,7 +967,10 @@ async function handleBeep(args: unknown): Promise<{
   const wantEcho = isTruthyParam(getField(args, "wait_echo"));
   let echoWaited = false;
   if (wantEcho) {
-    const maxWaitMs = duration_ms + 2000;
+    // Tone length + 6 s slack: the beep echo rides the NEXT poll, whose
+    // TLS handshake can collide with the firmware's 10 s sensor post —
+    // same race as the haptic echo budget, same margin.
+    const maxWaitMs = duration_ms + 6000;
     const checkIntervalMs = 100;
     const deadline = queuedAt + maxWaitMs;
     while (Date.now() < deadline) {
