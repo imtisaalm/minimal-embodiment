@@ -521,21 +521,40 @@ function queueCommand(cmd: PendingCommand): void {
   }
 }
 
-function waitForCommand(timeoutMs: number): Promise<PendingCommand | null> {
+function waitForCommand(
+  timeoutMs: number,
+  res: ServerResponse,
+): Promise<PendingCommand | null> {
+  // A half-open poll connection (the microcontroller dropped off WiFi
+  // without a FIN) must never take a command with it: don't dequeue for
+  // a socket that is already dead, and deregister the poller the moment
+  // the socket dies. Otherwise a queued command is silently lost into
+  // the dead connection for up to the long-poll timeout.
+  if (res.destroyed) return Promise.resolve(null);
   if (commandQueue.length > 0) {
     return Promise.resolve(commandQueue.shift()!);
   }
   return new Promise<PendingCommand | null>((resolve) => {
     const resolver: CommandResolver = (cmd) => {
-      clearTimeout(timer);
+      cleanup();
       resolve(cmd);
     };
-    commandPollers.push(resolver);
-    const timer = setTimeout(() => {
+    const onClose = () => {
       const idx = commandPollers.indexOf(resolver);
-      if (idx >= 0) commandPollers.splice(idx, 1);
+      if (idx >= 0) {
+        commandPollers.splice(idx, 1);
+        log("command/poll client gone; poller deregistered");
+      }
+      cleanup();
       resolve(null);
-    }, timeoutMs);
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      res.removeListener("close", onClose);
+    };
+    commandPollers.push(resolver);
+    const timer = setTimeout(onClose, timeoutMs);
+    res.on("close", onClose);
   });
 }
 
@@ -568,7 +587,10 @@ function classifyDbToEnv(db: number): BeepEcho["noise_env"] {
   return "loud";
 }
 
-async function handleCommandPoll(args: unknown): Promise<PendingCommand | null> {
+async function handleCommandPoll(
+  args: unknown,
+  res: ServerResponse,
+): Promise<PendingCommand | null> {
   // Side effect first: if this poll request carries echo data from a beep
   // the ESP32 just played, stash it before doing the actual long-poll.
   const echoFreq = asOptionalNumber(getField(args, "echo_freq"));
@@ -622,7 +644,7 @@ async function handleCommandPoll(args: unknown): Promise<PendingCommand | null> 
   if (waitRaw !== undefined) {
     waitSec = asIntInRange(waitRaw, "wait", 1, 30);
   }
-  return waitForCommand(waitSec * 1000);
+  return waitForCommand(waitSec * 1000, res);
 }
 
 function handleBeepEcho(): {
@@ -1202,10 +1224,20 @@ async function dispatch(
       // Unified long-poll for all output channels. ESP32 parses the `type`
       // field and dispatches to fireHaptic / drawFace / beepAt. Timeout
       // returns 204 so the client re-polls without parsing an empty body.
-      const cmd = await handleCommandPoll(args);
+      const cmd = await handleCommandPoll(args, res);
       if (cmd === null) {
-        res.writeHead(204, { "Cache-Control": "no-store" });
-        res.end();
+        if (!res.destroyed) {
+          res.writeHead(204, { "Cache-Control": "no-store" });
+          res.end();
+        }
+        return;
+      }
+      if (res.destroyed) {
+        // Socket died in the gap between dequeue and write. Put the
+        // command back at the FRONT so the next live poll gets it in
+        // FIFO order.
+        commandQueue.unshift(cmd);
+        log("command/poll client gone post-dequeue; command re-queued");
         return;
       }
       sendJson(res, 200, cmd);
