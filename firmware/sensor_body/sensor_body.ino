@@ -95,11 +95,14 @@
 #include <driver/i2s_std.h>
 #include <math.h>
 
-// ---- CONFIGURATION (fill these in before flashing) -----------------------
-
 // Real credentials live in secrets.h, which is gitignored so it never gets
 // pushed to GitHub. Copy secrets.example.h -> secrets.h and fill it in.
+// Keep this include here with the others: Arduino inserts its generated
+// function prototypes after the last include, and moving it further down
+// pushes them above the enum declarations they depend on.
 #include "secrets.h"
+
+// ---- CONFIGURATION (fill these in before flashing) -----------------------
 
 const char* WIFI_SSID     = SECRET_WIFI_SSID;
 const char* WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
@@ -115,10 +118,11 @@ const char* BRIDGE_TOKEN  = SECRET_BRIDGE_TOKEN;   // must match US_BRIDGE_TOKEN
 const bool  BRIDGE_USE_TLS = false;
 const char* BRIDGE_HOST    = SECRET_BRIDGE_HOST;
 
-// Scheme + host prefix for every bridge request.
-static inline String bridgeBase() {
-  return String(BRIDGE_USE_TLS ? "https://" : "http://") + BRIDGE_HOST;
-}
+// Scheme + host prefix for every bridge request. Deliberately a macro rather
+// than a function: Arduino generates its function prototypes immediately
+// before the first function definition in the sketch, so defining one up here
+// would push those prototypes above the enums on which they depend.
+#define BRIDGE_BASE_URL (String(BRIDGE_USE_TLS ? "https://" : "http://") + BRIDGE_HOST)
 
 // How often to read and post (milliseconds)
 const unsigned long POST_INTERVAL_MS = 10000;  // 10 seconds
@@ -1084,7 +1088,7 @@ void commandPollTask(void* param) {
       continue;
     }
 
-    String url = bridgeBase();
+    String url = BRIDGE_BASE_URL;
     url += "/command/poll?token=";
     url += BRIDGE_TOKEN;
     url += "&wait=25";
@@ -1331,7 +1335,7 @@ void loop() {
   // every request is a unique URL (defeats upstream proxy dedup).
   postCounter++;
 
-  String url = bridgeBase();
+  String url = BRIDGE_BASE_URL;
   url += "/sensor/update";
   url += postCounter;
   url += "?token=";
