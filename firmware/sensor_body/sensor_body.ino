@@ -97,10 +97,28 @@
 
 // ---- CONFIGURATION (fill these in before flashing) -----------------------
 
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* BRIDGE_TOKEN  = "YOUR_BRIDGE_TOKEN";   // must match US_BRIDGE_TOKEN on the bridge
-const char* BRIDGE_HOST   = "your-tunnel-host.example.com";
+// Real credentials live in secrets.h, which is gitignored so it never gets
+// pushed to GitHub. Copy secrets.example.h -> secrets.h and fill it in.
+#include "secrets.h"
+
+const char* WIFI_SSID     = SECRET_WIFI_SSID;
+const char* WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
+const char* BRIDGE_TOKEN  = SECRET_BRIDGE_TOKEN;   // must match US_BRIDGE_TOKEN on the bridge
+
+// Where the bridge lives.
+//   Local mode (BRIDGE_USE_TLS = false): the bridge is running on your own
+//   laptop, on the same WiFi as the ESP32. Put your laptop's LAN address and
+//   port here, e.g. "192.168.1.42:3737". This is all Phases 1-9 need.
+//
+//   Tunnel mode (BRIDGE_USE_TLS = true): the bridge is exposed on a public
+//   HTTPS hostname via cloudflared (Phase 11). Host only, no port.
+const bool  BRIDGE_USE_TLS = false;
+const char* BRIDGE_HOST    = SECRET_BRIDGE_HOST;
+
+// Scheme + host prefix for every bridge request.
+static inline String bridgeBase() {
+  return String(BRIDGE_USE_TLS ? "https://" : "http://") + BRIDGE_HOST;
+}
 
 // How often to read and post (milliseconds)
 const unsigned long POST_INTERVAL_MS = 10000;  // 10 seconds
@@ -1066,8 +1084,7 @@ void commandPollTask(void* param) {
       continue;
     }
 
-    String url = "https://";
-    url += BRIDGE_HOST;
+    String url = bridgeBase();
     url += "/command/poll?token=";
     url += BRIDGE_TOKEN;
     url += "&wait=25";
@@ -1314,8 +1331,7 @@ void loop() {
   // every request is a unique URL (defeats upstream proxy dedup).
   postCounter++;
 
-  String url = "https://";
-  url += BRIDGE_HOST;
+  String url = bridgeBase();
   url += "/sensor/update";
   url += postCounter;
   url += "?token=";

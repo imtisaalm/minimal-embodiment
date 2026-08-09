@@ -33,3 +33,6 @@ firmware/**/build/
 firmware/**/*.hex
 firmware/**/*.bin
 firmware/**/*.elf
+
+# Real credentials (WiFi password, bridge token) — never commit
+firmware/sensor_body/secrets.h
